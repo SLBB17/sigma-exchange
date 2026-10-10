@@ -643,11 +643,13 @@ async function restockPacks() {
 }
 
 app.use((err, req, res, next) => {
-  console.error("Erreur serveur :", err.message);
+  console.error("Erreur serveur :", err.stack || err.message);
 
   if (res.headersSent) return next(err);
+
   res.status(500).json({
-    error: "Une erreur interne est survenue."
+    error: "Une erreur interne est survenue.",
+    requestId: crypto.randomUUID()
   });
 });
 

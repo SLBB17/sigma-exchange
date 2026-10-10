@@ -1,27 +1,54 @@
+"use strict";
 
 require("dotenv").config();
 
+const path = require("path");
+const crypto = require("crypto");
 const express = require("express");
 const session = require("express-session");
 const connectPgSimple = require("connect-pg-simple");
 const bcrypt = require("bcryptjs");
-const crypto = require("crypto");
-const { pool, initDb } = require("./db");
+
+if (!process.env.SESSION_SECRET || process.env.SESSION_SECRET.length < 32) {
+  console.error("SESSION_SECRET doit contenir au moins 32 caractères.");
+  process.exit(1);
+}
+
+const { pool, initDb, safeRollback } = require("./db");
 
 const app = express();
 const PgStore = connectPgSimple(session);
-const PORT = process.env.PORT || 3000;
+const PORT = Number(process.env.PORT) || 3000;
 const isProduction = process.env.NODE_ENV === "production";
 
+// Hash factice : permet de dépenser le même temps de calcul quand le
+// compte n'existe pas, pour ne pas révéler quels pseudos existent.
+const DUMMY_HASH = bcrypt.hashSync("sigma-dummy-password", 12);
+
 app.disable("x-powered-by");
-
-if (!process.env.SESSION_SECRET || process.env.SESSION_SECRET.length < 32) {
-  throw new Error("SESSION_SECRET doit contenir au moins 32 caractères.");
-}
-
 app.set("trust proxy", 1);
+
+app.use((req, res, next) => {
+  res.set({
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Referrer-Policy": "same-origin",
+    "Content-Security-Policy":
+      "default-src 'self'; img-src 'self' data:; " +
+      "style-src 'self' 'unsafe-inline'; frame-ancestors 'none'; " +
+      "base-uri 'self'; form-action 'self'"
+  });
+  next();
+});
+
 app.use(express.json({ limit: "100kb" }));
 app.use(express.urlencoded({ extended: false, limit: "20kb" }));
+
+const cookieOptions = {
+  httpOnly: true,
+  secure: isProduction,
+  sameSite: "lax"
+};
 
 app.use(session({
   store: new PgStore({
@@ -34,14 +61,14 @@ app.use(session({
   resave: false,
   saveUninitialized: false,
   cookie: {
-    httpOnly: true,
-    secure: isProduction,
-    sameSite: "lax",
+    ...cookieOptions,
     maxAge: 7 * 24 * 60 * 60 * 1000
   }
 }));
 
-app.use(express.static("public"));
+// Chemin absolu : le site fonctionne quel que soit le dossier
+// depuis lequel on lance « node server.js ».
+app.use(express.static(path.join(__dirname, "public")));
 
 function asyncRoute(handler) {
   return (req, res, next) =>
@@ -51,6 +78,56 @@ function asyncRoute(handler) {
 function fail(res, status, message) {
   return res.status(status).json({ error: message });
 }
+
+// Avec Express 5, req.body vaut undefined quand aucun corps n'est reçu.
+function getBody(req) {
+  return req.body && typeof req.body === "object" ? req.body : {};
+}
+
+// Limiteur de requêtes en mémoire (par adresse IP).
+function rateLimit({ windowMs, max, message }) {
+  const hits = new Map();
+
+  const cleaner = setInterval(() => {
+    const now = Date.now();
+    for (const [key, entry] of hits) {
+      if (entry.reset <= now) hits.delete(key);
+    }
+  }, windowMs);
+  cleaner.unref();
+
+  return (req, res, next) => {
+    const now = Date.now();
+    const key = req.ip || "inconnu";
+    let entry = hits.get(key);
+
+    if (!entry || entry.reset <= now) {
+      entry = { count: 0, reset: now + windowMs };
+      hits.set(key, entry);
+    }
+
+    entry.count += 1;
+
+    if (entry.count > max) {
+      res.set("Retry-After", String(Math.ceil((entry.reset - now) / 1000)));
+      return fail(res, 429, message);
+    }
+
+    next();
+  };
+}
+
+const loginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 30,
+  message: "Trop de tentatives. Réessaie dans quelques minutes."
+});
+
+const registerLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 15,
+  message: "Trop de créations de compte. Réessaie plus tard."
+});
 
 function requireAuth(req, res, next) {
   if (!req.session.userId) {
@@ -90,7 +167,7 @@ function randomCard(cards) {
   }
 
   const roll = Math.random() * 100;
-  let rarity = roll < 1 ? "legendary"
+  const rarity = roll < 1 ? "legendary"
     : roll < 6 ? "epic"
     : roll < 25 ? "rare"
     : "common";
@@ -112,8 +189,8 @@ async function recordTransaction(client, userId, type, details) {
 // Crée ou met à jour l'administrateur uniquement si les variables
 // secrètes d'administration sont configurées dans Render.
 async function configureAdmin() {
-  const username = process.env.ADMIN_USERNAME;
-  const password = process.env.ADMIN_PASSWORD;
+  const username = (process.env.ADMIN_USERNAME || "").trim();
+  const password = process.env.ADMIN_PASSWORD || "";
 
   if (!username && !password) {
     console.log("ADMIN_USERNAME/ADMIN_PASSWORD absents : aucun admin modifié.");
@@ -172,9 +249,10 @@ app.get("/api/me", asyncRoute(async (req, res) => {
   res.json({ user: result.rows[0] });
 }));
 
-app.post("/api/register", asyncRoute(async (req, res) => {
-  const username = String(req.body.username || "").trim();
-  const password = String(req.body.password || "");
+app.post("/api/register", registerLimiter, asyncRoute(async (req, res) => {
+  const body = getBody(req);
+  const username = String(body.username || "").trim();
+  const password = String(body.password || "");
 
   if (!/^[a-zA-Z0-9_-]{3,30}$/.test(username)) {
     return fail(res, 400, "Le nom doit contenir de 3 à 30 lettres, chiffres, _ ou -.");
@@ -195,6 +273,7 @@ app.post("/api/register", asyncRoute(async (req, res) => {
 
   const hash = await bcrypt.hash(password, 12);
   const client = await pool.connect();
+  let user;
 
   try {
     await client.query("BEGIN");
@@ -206,7 +285,8 @@ app.post("/api/register", asyncRoute(async (req, res) => {
       [username, hash]
     );
 
-    const user = created.rows[0];
+    user = created.rows[0];
+
     const title = await client.query(
       "SELECT id FROM titles WHERE name = $1 LIMIT 1",
       ["Nouveau membre"]
@@ -215,27 +295,18 @@ app.post("/api/register", asyncRoute(async (req, res) => {
     if (title.rows.length) {
       await client.query(
         `INSERT INTO user_titles (user_id, title_id)
-         SELECT $1, $2
+         SELECT $1::int, $2::int
          WHERE NOT EXISTS (
-           SELECT 1 FROM user_titles WHERE user_id = $1 AND title_id = $2
+           SELECT 1 FROM user_titles
+           WHERE user_id = $1::int AND title_id = $2::int
          )`,
         [user.id, title.rows[0].id]
       );
     }
 
     await client.query("COMMIT");
-
-    req.session.regenerate((err) => {
-      if (err) return res.status(500).json({ error: "Impossible de créer la session." });
-
-      req.session.userId = user.id;
-      req.session.save((saveErr) => {
-        if (saveErr) return res.status(500).json({ error: "Impossible d'enregistrer la session." });
-        res.status(201).json({ user });
-      });
-    });
   } catch (err) {
-    await client.query("ROLLBACK");
+    await safeRollback(client);
     if (err.code === "23505") {
       return fail(res, 409, "Ce nom d'utilisateur existe déjà.");
     }
@@ -243,11 +314,22 @@ app.post("/api/register", asyncRoute(async (req, res) => {
   } finally {
     client.release();
   }
+
+  req.session.regenerate((err) => {
+    if (err) return fail(res, 500, "Impossible de créer la session.");
+
+    req.session.userId = user.id;
+    req.session.save((saveErr) => {
+      if (saveErr) return fail(res, 500, "Impossible d'enregistrer la session.");
+      res.status(201).json({ user });
+    });
+  });
 }));
 
-app.post("/api/login", asyncRoute(async (req, res) => {
-  const username = String(req.body.username || "").trim();
-  const password = String(req.body.password || "");
+app.post("/api/login", loginLimiter, asyncRoute(async (req, res) => {
+  const body = getBody(req);
+  const username = String(body.username || "").trim();
+  const password = String(body.password || "");
 
   const result = await pool.query(
     `SELECT id, username, password_hash, role, balance, created_at
@@ -256,17 +338,21 @@ app.post("/api/login", asyncRoute(async (req, res) => {
   );
 
   const user = result.rows[0];
-  if (!user || !user.password_hash ||
-      !(await bcrypt.compare(password, user.password_hash))) {
+  const passwordOk = await bcrypt.compare(
+    password,
+    user && user.password_hash ? user.password_hash : DUMMY_HASH
+  );
+
+  if (!user || !user.password_hash || !passwordOk) {
     return fail(res, 401, "Identifiants incorrects.");
   }
 
   req.session.regenerate((err) => {
-    if (err) return res.status(500).json({ error: "Impossible de créer la session." });
+    if (err) return fail(res, 500, "Impossible de créer la session.");
 
     req.session.userId = user.id;
     req.session.save((saveErr) => {
-      if (saveErr) return res.status(500).json({ error: "Impossible d'enregistrer la session." });
+      if (saveErr) return fail(res, 500, "Impossible d'enregistrer la session.");
 
       delete user.password_hash;
       res.json({ user });
@@ -276,8 +362,8 @@ app.post("/api/login", asyncRoute(async (req, res) => {
 
 app.post("/api/logout", (req, res) => {
   req.session.destroy((err) => {
-    if (err) return res.status(500).json({ error: "Déconnexion impossible." });
-    res.clearCookie("sigma.sid");
+    if (err) return fail(res, 500, "Déconnexion impossible.");
+    res.clearCookie("sigma.sid", cookieOptions);
     res.json({ ok: true });
   });
 });
@@ -308,12 +394,18 @@ app.get("/api/portfolio", requireAuth, asyncRoute(async (req, res) => {
 }));
 
 app.post("/api/trade", requireAuth, asyncRoute(async (req, res) => {
-  const symbol = String(req.body.symbol || "").trim().toUpperCase();
-  const side = String(req.body.side || "").toLowerCase();
-  const quantity = Number(req.body.quantity);
+  const body = getBody(req);
+  const symbol = String(body.symbol || "").trim().toUpperCase();
+  const side = String(body.side || "").toLowerCase();
 
-  if (!symbol || !["buy", "sell"].includes(side) ||
-      !Number.isFinite(quantity) || quantity <= 0 || quantity > 1000000) {
+  const rawQuantity = typeof body.quantity === "number" || typeof body.quantity === "string"
+    ? Number(body.quantity)
+    : NaN;
+  // La base stocke 8 décimales : on arrondit pareil côté serveur.
+  const quantity = Number(rawQuantity.toFixed(8));
+
+  if (!symbol || symbol.length > 20 || !["buy", "sell"].includes(side) ||
+      !Number.isFinite(quantity) || quantity < 0.00000001 || quantity > 1000000) {
     return fail(res, 400, "Ordre invalide.");
   }
 
@@ -353,14 +445,20 @@ app.post("/api/trade", requireAuth, asyncRoute(async (req, res) => {
     const oldAverage = Number(holding?.average_price || 0);
 
     if (side === "buy") {
+      // Empêche d'obtenir des titres gratuitement avec une quantité minuscule.
+      if (total < 0.01) {
+        await client.query("ROLLBACK");
+        return fail(res, 400, "Ordre trop petit.");
+      }
+
       if (balance < total) {
         await client.query("ROLLBACK");
         return fail(res, 400, "Solde insuffisant.");
       }
 
-      const newQuantity = oldQuantity + quantity;
+      const newQuantity = Number((oldQuantity + quantity).toFixed(8));
       const newAverage = newQuantity > 0
-        ? ((oldQuantity * oldAverage + quantity * price) / newQuantity)
+        ? Number(((oldQuantity * oldAverage + quantity * price) / newQuantity).toFixed(8))
         : price;
 
       await client.query(
@@ -382,9 +480,19 @@ app.post("/api/trade", requireAuth, asyncRoute(async (req, res) => {
         );
       }
     } else {
-      if (oldQuantity < quantity) {
+      if (quantity - oldQuantity > 0.000000001) {
         await client.query("ROLLBACK");
         return fail(res, 400, "Tu ne possèdes pas assez de titres.");
+      }
+
+      const remaining = Number((oldQuantity - quantity).toFixed(8));
+      const closesPosition = remaining <= 0.000000001;
+
+      // Une vente partielle trop petite rapporterait 0 : on la refuse,
+      // mais on autorise toujours à solder entièrement une position.
+      if (total < 0.01 && !closesPosition) {
+        await client.query("ROLLBACK");
+        return fail(res, 400, "Ordre trop petit.");
       }
 
       await client.query(
@@ -392,8 +500,7 @@ app.post("/api/trade", requireAuth, asyncRoute(async (req, res) => {
         [total, req.session.userId]
       );
 
-      const remaining = oldQuantity - quantity;
-      if (remaining <= 0.000000001) {
+      if (closesPosition) {
         await client.query(
           "DELETE FROM holdings WHERE user_id = $1 AND symbol = $2",
           [req.session.userId, symbol]
@@ -418,7 +525,7 @@ app.post("/api/trade", requireAuth, asyncRoute(async (req, res) => {
     await client.query("COMMIT");
     res.json({ balance: updated.rows[0].balance, symbol, quantity, price, total });
   } catch (err) {
-    await client.query("ROLLBACK");
+    await safeRollback(client);
     throw err;
   } finally {
     client.release();
@@ -429,7 +536,7 @@ app.get("/api/transactions", requireAuth, asyncRoute(async (req, res) => {
   const result = await pool.query(
     `SELECT id, type, details, created_at
      FROM transactions WHERE user_id = $1
-     ORDER BY created_at DESC LIMIT 100`,
+     ORDER BY created_at DESC, id DESC LIMIT 100`,
     [req.session.userId]
   );
   res.json({ transactions: result.rows });
@@ -451,13 +558,13 @@ app.get("/api/cards", requireAuth, asyncRoute(async (req, res) => {
 app.get("/api/shop", asyncRoute(async (req, res) => {
   const result = await pool.query(
     `SELECT id, name, description, price, stock, image_url
-     FROM shop_packs WHERE active = TRUE ORDER BY price`
+     FROM shop_packs WHERE active = TRUE ORDER BY price, id`
   );
   res.json({ packs: result.rows });
 }));
 
 app.post("/api/shop/buy", requireAuth, asyncRoute(async (req, res) => {
-  const packId = Number(req.body.packId);
+  const packId = Number(getBody(req).packId);
   if (!Number.isInteger(packId) || packId <= 0) {
     return fail(res, 400, "Pack invalide.");
   }
@@ -486,7 +593,9 @@ app.post("/api/shop/buy", requireAuth, asyncRoute(async (req, res) => {
       "SELECT balance FROM users WHERE id = $1 FOR UPDATE",
       [req.session.userId]
     );
-    const balance = Number(userResult.rows[0]?.balance ?? 0);
+    if (!userResult.rows.length) throw new Error("Utilisateur introuvable.");
+
+    const balance = Number(userResult.rows[0].balance);
     const price = Number(pack.price);
 
     if (balance < price) {
@@ -539,7 +648,7 @@ app.post("/api/shop/buy", requireAuth, asyncRoute(async (req, res) => {
     await client.query("COMMIT");
     res.json({ balance: updated.rows[0].balance, cards: [card] });
   } catch (err) {
-    await client.query("ROLLBACK");
+    await safeRollback(client);
     throw err;
   } finally {
     client.release();
@@ -587,7 +696,7 @@ app.post("/api/admin/shop/restock", requireAuth, requireAdmin, asyncRoute(async 
     await client.query("COMMIT");
     res.json({ ok: true, message: "Stocks réapprovisionnés." });
   } catch (err) {
-    await client.query("ROLLBACK");
+    await safeRollback(client);
     throw err;
   } finally {
     client.release();
@@ -642,27 +751,85 @@ async function restockPacks() {
   }
 }
 
-app.use((err, req, res, next) => {
-  console.error("Erreur serveur :", err.stack || err.message);
+// Les routes /api inconnues répondent en JSON (et non en page HTML).
+app.use("/api", (req, res) => {
+  fail(res, 404, "Route introuvable.");
+});
 
+app.use((err, req, res, next) => {
   if (res.headersSent) return next(err);
+
+  // Erreurs du client (JSON mal formé, corps trop gros...) : 4xx, pas 500.
+  const status = Number(err.status || err.statusCode);
+  if (status >= 400 && status < 500) {
+    return fail(
+      res,
+      status,
+      err.type === "entity.too.large"
+        ? "Requête trop volumineuse."
+        : "Requête invalide."
+    );
+  }
+
+  const requestId = crypto.randomUUID();
+  console.error(`Erreur serveur [${requestId}] :`, err.stack || err.message);
 
   res.status(500).json({
     error: "Une erreur interne est survenue.",
-    requestId: crypto.randomUUID()
+    requestId
   });
+});
+
+let server = null;
+let marketTimer = null;
+let restockTimer = null;
+let shuttingDown = false;
+
+async function shutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`${signal} reçu : arrêt en cours...`);
+
+  clearInterval(marketTimer);
+  clearInterval(restockTimer);
+
+  const forceExit = setTimeout(() => process.exit(1), 10000);
+  forceExit.unref();
+
+  try {
+    if (server) {
+      await new Promise((resolve) => server.close(resolve));
+    }
+    await pool.end();
+  } catch (err) {
+    console.error("Erreur pendant l'arrêt :", err.message);
+  }
+
+  process.exit(0);
+}
+
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => shutdown("SIGINT"));
+
+process.on("unhandledRejection", (reason) => {
+  console.error("Promesse rejetée non gérée :", reason);
 });
 
 async function start() {
   await initDb();
   await configureAdmin();
 
-  app.listen(PORT, "0.0.0.0", () => {
+  server = app.listen(PORT, "0.0.0.0", () => {
     console.log(`Sigma Exchange écoute sur le port ${PORT}.`);
   });
 
-  setInterval(updateMarket, 60 * 1000);
-  setInterval(restockPacks, 5 * 60 * 1000);
+  server.on("error", (err) => {
+    console.error("Erreur du serveur HTTP :", err.message);
+    process.exit(1);
+  });
+
+  marketTimer = setInterval(updateMarket, 60 * 1000);
+  restockTimer = setInterval(restockPacks, 5 * 60 * 1000);
 
   // Initialise le marché sans attendre la première minute.
   updateMarket();

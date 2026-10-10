@@ -1,111 +1,246 @@
 
-async function initDb(pool) {
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS users (
-      id BIGSERIAL PRIMARY KEY,
-      username VARCHAR(20) NOT NULL UNIQUE,
-      password_hash TEXT NOT NULL,
-      role VARCHAR(20) NOT NULL DEFAULT 'user',
-      balance NUMERIC(18,2) NOT NULL DEFAULT 10000,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
+const { Pool } = require("pg");
 
-    CREATE TABLE IF NOT EXISTS holdings (
-      user_id BIGINT REFERENCES users(id) ON DELETE CASCADE,
-      symbol VARCHAR(20) NOT NULL,
-      quantity NUMERIC(18,6) NOT NULL DEFAULT 0,
-      average_price NUMERIC(18,4) NOT NULL DEFAULT 0,
-      PRIMARY KEY (user_id, symbol)
-    );
-
-    CREATE TABLE IF NOT EXISTS cards (
-      id BIGSERIAL PRIMARY KEY,
-      name TEXT NOT NULL UNIQUE,
-      rarity VARCHAR(20) NOT NULL DEFAULT 'common',
-      image_url TEXT,
-      description TEXT NOT NULL DEFAULT ''
-    );
-
-    CREATE TABLE IF NOT EXISTS user_cards (
-      user_id BIGINT REFERENCES users(id) ON DELETE CASCADE,
-      card_id BIGINT REFERENCES cards(id) ON DELETE CASCADE,
-      quantity INTEGER NOT NULL DEFAULT 0,
-      PRIMARY KEY (user_id, card_id)
-    );
-
-    CREATE TABLE IF NOT EXISTS shop_packs (
-      id BIGSERIAL PRIMARY KEY,
-      name TEXT NOT NULL,
-      description TEXT NOT NULL DEFAULT '',
-      price NUMERIC(12,2) NOT NULL DEFAULT 100,
-      stock INTEGER NOT NULL DEFAULT 0,
-      image_url TEXT,
-      active BOOLEAN NOT NULL DEFAULT TRUE
-    );
-
-    CREATE TABLE IF NOT EXISTS titles (
-      id BIGSERIAL PRIMARY KEY,
-      name TEXT NOT NULL UNIQUE,
-      description TEXT NOT NULL DEFAULT ''
-    );
-
-    CREATE TABLE IF NOT EXISTS user_titles (
-      user_id BIGINT REFERENCES users(id) ON DELETE CASCADE,
-      title_id BIGINT REFERENCES titles(id) ON DELETE CASCADE,
-      PRIMARY KEY (user_id, title_id)
-    );
-
-    CREATE TABLE IF NOT EXISTS market_assets (
-      symbol VARCHAR(20) PRIMARY KEY,
-      name TEXT NOT NULL,
-      price NUMERIC(18,4) NOT NULL,
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
-
-    CREATE TABLE IF NOT EXISTS transactions (
-      id BIGSERIAL PRIMARY KEY,
-      user_id BIGINT REFERENCES users(id) ON DELETE CASCADE,
-      type VARCHAR(30) NOT NULL,
-      details JSONB NOT NULL DEFAULT '{}',
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
-  `);
-
-  await pool.query(`
-    INSERT INTO shop_packs (name, description, price, stock)
-    SELECT v.name, v.description, v.price, v.stock
-    FROM (VALUES
-      ('Pack Découverte', 'Des cartes pour commencer ta collection.', 100, 10),
-      ('Pack Premium', 'Un pack de cartes aux raretés variées.', 500, 6),
-      ('Pack Légendaire', 'Un pack spécial de collection.', 1500, 2)
-    ) AS v(name, description, price, stock)
-    WHERE NOT EXISTS (
-      SELECT 1 FROM shop_packs WHERE shop_packs.name = v.name
-    );
-
-    INSERT INTO cards (name, rarity, description)
-    VALUES
-      ('Nova', 'common', 'Une carte de la collection Sigma.'),
-      ('Orion', 'rare', 'Une carte rare de la collection Sigma.'),
-      ('Eclipse', 'epic', 'Une carte épique de la collection Sigma.'),
-      ('Singularity', 'legendary', 'Une carte légendaire de la collection Sigma.')
-    ON CONFLICT (name) DO NOTHING;
-
-    INSERT INTO titles (name, description)
-    VALUES
-      ('Nouveau membre', 'Bienvenue sur Sigma Exchange.'),
-      ('Collectionneur', 'Collectionne tes premières cartes.'),
-      ('Investisseur', 'Découvre le marché simulé.')
-    ON CONFLICT (name) DO NOTHING;
-
-    INSERT INTO market_assets (symbol, name, price)
-    VALUES
-      ('SIG', 'Sigma Technologies', 120.00),
-      ('NOVA', 'Nova Systems', 85.00),
-      ('ORX', 'Orion Industries', 210.00),
-      ('ECL', 'Eclipse Energy', 64.00)
-    ON CONFLICT (symbol) DO NOTHING;
-  `);
+if (!process.env.DATABASE_URL) {
+  throw new Error("La variable DATABASE_URL est absente.");
 }
 
-module.exports = { initDb };
+const isProduction = process.env.NODE_ENV === "production";
+
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: isProduction ? { rejectUnauthorized: false } : false,
+  connectionTimeoutMillis: 15000,
+  idleTimeoutMillis: 30000,
+  max: 10
+});
+
+pool.on("error", (err) => {
+  console.error("Erreur PostgreSQL inattendue :", err.message);
+});
+
+async function addColumn(table, column, definition) {
+  // Les noms de table et de colonne sont des constantes internes,
+  // jamais des valeurs fournies par un utilisateur.
+  await pool.query(
+    `ALTER TABLE "${table}" ADD COLUMN IF NOT EXISTS "${column}" ${definition}`
+  );
+}
+
+async function initDb() {
+  const client = await pool.connect();
+
+  try {
+    await client.query("BEGIN");
+
+    // Crée les tables qui n'existent pas encore.
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS users (
+        id SERIAL PRIMARY KEY,
+        username VARCHAR(50) NOT NULL UNIQUE,
+        password_hash TEXT NOT NULL,
+        role VARCHAR(20) NOT NULL DEFAULT 'user',
+        balance NUMERIC(15,2) NOT NULL DEFAULT 10000,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+
+      CREATE TABLE IF NOT EXISTS holdings (
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        symbol VARCHAR(20) NOT NULL,
+        quantity NUMERIC(20,8) NOT NULL DEFAULT 0,
+        average_price NUMERIC(20,8) NOT NULL DEFAULT 0,
+        PRIMARY KEY (user_id, symbol)
+      );
+
+      CREATE TABLE IF NOT EXISTS cards (
+        id SERIAL PRIMARY KEY,
+        name VARCHAR(100) NOT NULL,
+        rarity VARCHAR(30) NOT NULL DEFAULT 'common',
+        image_url TEXT,
+        description TEXT NOT NULL DEFAULT ''
+      );
+
+      CREATE TABLE IF NOT EXISTS user_cards (
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        card_id INTEGER NOT NULL REFERENCES cards(id) ON DELETE CASCADE,
+        quantity INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (user_id, card_id)
+      );
+
+      CREATE TABLE IF NOT EXISTS shop_packs (
+        id SERIAL PRIMARY KEY,
+        name VARCHAR(100) NOT NULL,
+        description TEXT NOT NULL DEFAULT '',
+        price NUMERIC(15,2) NOT NULL DEFAULT 100,
+        stock INTEGER NOT NULL DEFAULT 0,
+        image_url TEXT,
+        active BOOLEAN NOT NULL DEFAULT TRUE
+      );
+
+      CREATE TABLE IF NOT EXISTS titles (
+        id SERIAL PRIMARY KEY,
+        name VARCHAR(100) NOT NULL,
+        description TEXT NOT NULL DEFAULT ''
+      );
+
+      CREATE TABLE IF NOT EXISTS user_titles (
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        title_id INTEGER NOT NULL REFERENCES titles(id) ON DELETE CASCADE,
+        PRIMARY KEY (user_id, title_id)
+      );
+
+      CREATE TABLE IF NOT EXISTS market_assets (
+        symbol VARCHAR(20) PRIMARY KEY,
+        name VARCHAR(100) NOT NULL,
+        price NUMERIC(20,8) NOT NULL DEFAULT 100,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+
+      CREATE TABLE IF NOT EXISTS transactions (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        type VARCHAR(30) NOT NULL,
+        details JSONB NOT NULL DEFAULT '{}'::jsonb,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+    `);
+
+    // Migration additive : complète les anciennes tables sans
+    // effacer leurs lignes ni recréer la base.
+    const migrations = [
+      ["users", "id", "SERIAL"],
+      ["users", "username", "VARCHAR(50)"],
+      ["users", "password_hash", "TEXT"],
+      ["users", "role", "VARCHAR(20) NOT NULL DEFAULT 'user'"],
+      ["users", "balance", "NUMERIC(15,2) NOT NULL DEFAULT 10000"],
+      ["users", "created_at", "TIMESTAMPTZ NOT NULL DEFAULT NOW()"],
+
+      ["holdings", "user_id", "INTEGER"],
+      ["holdings", "symbol", "VARCHAR(20)"],
+      ["holdings", "quantity", "NUMERIC(20,8) NOT NULL DEFAULT 0"],
+      ["holdings", "average_price", "NUMERIC(20,8) NOT NULL DEFAULT 0"],
+
+      ["cards", "id", "SERIAL"],
+      ["cards", "name", "VARCHAR(100)"],
+      ["cards", "rarity", "VARCHAR(30) NOT NULL DEFAULT 'common'"],
+      ["cards", "image_url", "TEXT"],
+      ["cards", "description", "TEXT NOT NULL DEFAULT ''"],
+
+      ["user_cards", "user_id", "INTEGER"],
+      ["user_cards", "card_id", "INTEGER"],
+      ["user_cards", "quantity", "INTEGER NOT NULL DEFAULT 0"],
+
+      ["shop_packs", "id", "SERIAL"],
+      ["shop_packs", "name", "VARCHAR(100)"],
+      ["shop_packs", "description", "TEXT NOT NULL DEFAULT ''"],
+      ["shop_packs", "price", "NUMERIC(15,2) NOT NULL DEFAULT 100"],
+      ["shop_packs", "stock", "INTEGER NOT NULL DEFAULT 0"],
+      ["shop_packs", "image_url", "TEXT"],
+      ["shop_packs", "active", "BOOLEAN NOT NULL DEFAULT TRUE"],
+
+      ["titles", "id", "SERIAL"],
+      ["titles", "name", "VARCHAR(100)"],
+      ["titles", "description", "TEXT NOT NULL DEFAULT ''"],
+
+      ["user_titles", "user_id", "INTEGER"],
+      ["user_titles", "title_id", "INTEGER"],
+
+      ["market_assets", "symbol", "VARCHAR(20)"],
+      ["market_assets", "name", "VARCHAR(100)"],
+      ["market_assets", "price", "NUMERIC(20,8) NOT NULL DEFAULT 100"],
+      ["market_assets", "updated_at", "TIMESTAMPTZ NOT NULL DEFAULT NOW()"],
+
+      ["transactions", "id", "SERIAL"],
+      ["transactions", "user_id", "INTEGER"],
+      ["transactions", "type", "VARCHAR(30)"],
+      ["transactions", "details", "JSONB NOT NULL DEFAULT '{}'::jsonb"],
+      ["transactions", "created_at", "TIMESTAMPTZ NOT NULL DEFAULT NOW()"]
+    ];
+
+    for (const [table, column, definition] of migrations) {
+      await client.query(
+        `ALTER TABLE "${table}" ADD COLUMN IF NOT EXISTS "${column}" ${definition}`
+      );
+    }
+
+    // Données initiales : ajoutées seulement si elles n'existent pas.
+    const cards = [
+      ["Nova", "common", "Carte de départ de la collection."],
+      ["Orion", "rare", "Une carte rare de l'univers Sigma."],
+      ["Eclipse", "epic", "Une carte épique très recherchée."],
+      ["Singularity", "legendary", "Une carte légendaire de collection."]
+    ];
+
+    for (const [name, rarity, description] of cards) {
+      await client.query(
+        `INSERT INTO cards (name, rarity, description)
+         SELECT $1, $2, $3
+         WHERE NOT EXISTS (
+           SELECT 1 FROM cards WHERE name = $1
+         )`,
+        [name, rarity, description]
+      );
+    }
+
+    const packs = [
+      ["Découverte", "Un pack pour commencer ta collection.", 100, 20],
+      ["Premium", "Un pack avec des cartes plus rares.", 350, 10],
+      ["Légendaire", "Un pack de collection haut de gamme.", 800, 3]
+    ];
+
+    for (const [name, description, price, stock] of packs) {
+      await client.query(
+        `INSERT INTO shop_packs (name, description, price, stock, active)
+         SELECT $1, $2, $3, $4, TRUE
+         WHERE NOT EXISTS (
+           SELECT 1 FROM shop_packs WHERE name = $1
+         )`,
+        [name, description, price, stock]
+      );
+    }
+
+    const titles = [
+      ["Nouveau membre", "Bienvenue dans Sigma Exchange."],
+      ["Collectionneur", "Tu collectionnes les cartes Sigma."],
+      ["Investisseur", "Tu as commencé à investir sur le marché."]
+    ];
+
+    for (const [name, description] of titles) {
+      await client.query(
+        `INSERT INTO titles (name, description)
+         SELECT $1, $2
+         WHERE NOT EXISTS (
+           SELECT 1 FROM titles WHERE name = $1
+         )`,
+        [name, description]
+      );
+    }
+
+    const assets = [
+      ["SIG", "Sigma", 100],
+      ["NOVA", "Nova Systems", 45],
+      ["ORX", "Orion Exchange", 75],
+      ["ECL", "Eclipse Labs", 125]
+    ];
+
+    for (const [symbol, name, price] of assets) {
+      await client.query(
+        `INSERT INTO market_assets (symbol, name, price)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (symbol) DO NOTHING`,
+        [symbol, name, price]
+      );
+    }
+
+    await client.query("COMMIT");
+    console.log("Base PostgreSQL vérifiée et migrations terminées.");
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("Échec de l'initialisation PostgreSQL :", err.message);
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+module.exports = { pool, initDb };

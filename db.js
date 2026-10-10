@@ -1,3 +1,4 @@
+"use strict";
 
 const { Pool } = require("pg");
 
@@ -19,12 +20,14 @@ pool.on("error", (err) => {
   console.error("Erreur PostgreSQL inattendue :", err.message);
 });
 
-async function addColumn(table, column, definition) {
-  // Les noms de table et de colonne sont des constantes internes,
-  // jamais des valeurs fournies par un utilisateur.
-  await pool.query(
-    `ALTER TABLE "${table}" ADD COLUMN IF NOT EXISTS "${column}" ${definition}`
-  );
+// ROLLBACK qui ne masque jamais l'erreur d'origine
+// (par exemple si la connexion est déjà perdue).
+async function safeRollback(client) {
+  try {
+    await client.query("ROLLBACK");
+  } catch (err) {
+    console.error("ROLLBACK impossible :", err.message);
+  }
 }
 
 async function initDb() {
@@ -32,6 +35,10 @@ async function initDb() {
 
   try {
     await client.query("BEGIN");
+
+    // Verrou léger : évite les doublons de données initiales si deux
+    // instances démarrent en même temps (déploiement, redémarrage).
+    await client.query("SELECT pg_advisory_xact_lock(727001)");
 
     // Crée les tables qui n'existent pas encore.
     await client.query(`
@@ -107,6 +114,8 @@ async function initDb() {
 
     // Migration additive : complète les anciennes tables sans
     // effacer leurs lignes ni recréer la base.
+    // Les noms ci-dessous sont des constantes internes, jamais des
+    // valeurs fournies par un utilisateur.
     const migrations = [
       ["users", "id", "SERIAL"],
       ["users", "username", "VARCHAR(50)"],
@@ -164,6 +173,9 @@ async function initDb() {
     }
 
     // Données initiales : ajoutées seulement si elles n'existent pas.
+    // Les casts explicites (::text, ::numeric, ::int) évitent l'erreur
+    // PostgreSQL « inconsistent types deduced for parameter $1 » quand
+    // un même paramètre est utilisé dans le SELECT et dans le WHERE.
     const cards = [
       ["Nova", "common", "Carte de départ de la collection."],
       ["Orion", "rare", "Une carte rare de l'univers Sigma."],
@@ -174,9 +186,9 @@ async function initDb() {
     for (const [name, rarity, description] of cards) {
       await client.query(
         `INSERT INTO cards (name, rarity, description)
-         SELECT $1, $2, $3
+         SELECT $1::text, $2::text, $3::text
          WHERE NOT EXISTS (
-           SELECT 1 FROM cards WHERE name = $1
+           SELECT 1 FROM cards WHERE name = $1::text
          )`,
         [name, rarity, description]
       );
@@ -191,9 +203,9 @@ async function initDb() {
     for (const [name, description, price, stock] of packs) {
       await client.query(
         `INSERT INTO shop_packs (name, description, price, stock, active)
-         SELECT $1, $2, $3, $4, TRUE
+         SELECT $1::text, $2::text, $3::numeric, $4::int, TRUE
          WHERE NOT EXISTS (
-           SELECT 1 FROM shop_packs WHERE name = $1
+           SELECT 1 FROM shop_packs WHERE name = $1::text
          )`,
         [name, description, price, stock]
       );
@@ -208,14 +220,17 @@ async function initDb() {
     for (const [name, description] of titles) {
       await client.query(
         `INSERT INTO titles (name, description)
-         SELECT $1, $2
+         SELECT $1::text, $2::text
          WHERE NOT EXISTS (
-           SELECT 1 FROM titles WHERE name = $1
+           SELECT 1 FROM titles WHERE name = $1::text
          )`,
         [name, description]
       );
     }
 
+    // WHERE NOT EXISTS plutôt que ON CONFLICT (symbol) : fonctionne même
+    // si une ancienne table market_assets n'a pas de contrainte unique
+    // sur « symbol ».
     const assets = [
       ["SIG", "Sigma", 100],
       ["NOVA", "Nova Systems", 45],
@@ -226,21 +241,39 @@ async function initDb() {
     for (const [symbol, name, price] of assets) {
       await client.query(
         `INSERT INTO market_assets (symbol, name, price)
-         VALUES ($1, $2, $3)
-         ON CONFLICT (symbol) DO NOTHING`,
+         SELECT $1::text, $2::text, $3::numeric
+         WHERE NOT EXISTS (
+           SELECT 1 FROM market_assets WHERE symbol = $1::text
+         )`,
         [symbol, name, price]
       );
     }
 
     await client.query("COMMIT");
-    console.log("Base PostgreSQL vérifiée et migrations terminées.");
   } catch (err) {
-    await client.query("ROLLBACK");
+    await safeRollback(client);
     console.error("Échec de l'initialisation PostgreSQL :", err.message);
     throw err;
   } finally {
     client.release();
   }
+
+  // Empêche deux comptes « Bob » et « bob » créés au même instant.
+  // Hors transaction : si d'anciens doublons existent déjà, on prévient
+  // simplement au lieu d'empêcher le serveur de démarrer.
+  try {
+    await pool.query(
+      `CREATE UNIQUE INDEX IF NOT EXISTS users_username_lower_idx
+       ON users (LOWER(username))`
+    );
+  } catch (err) {
+    console.warn(
+      "Index d'unicité insensible à la casse non créé " +
+      "(doublons existants ?) :", err.message
+    );
+  }
+
+  console.log("Base PostgreSQL vérifiée et migrations terminées.");
 }
 
-module.exports = { pool, initDb };
+module.exports = { pool, initDb, safeRollback };

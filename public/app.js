@@ -1,3 +1,4 @@
+"use strict";
 
 const $ = (selector) => document.querySelector(selector);
 
@@ -10,6 +11,13 @@ const money = (value) =>
     maximumFractionDigits: 2
   }) + " crédits";
 
+function escapeHtml(value) {
+  return String(value ?? "").replace(/[&<>"']/g, (char) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;",
+    '"': "&quot;", "'": "&#39;"
+  })[char]);
+}
+
 async function api(url, options = {}) {
   const response = await fetch(url, {
     credentials: "same-origin",
@@ -21,7 +29,18 @@ async function api(url, options = {}) {
   });
 
   const data = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(data.error || "Une erreur est survenue.");
+
+  if (!response.ok) {
+    // Session expirée pendant l'utilisation : retour à l'écran de connexion.
+    if (response.status === 401 && currentUser) {
+      currentUser = null;
+      resetTabs();
+      renderAccount();
+      showMessage("Ta session a expiré. Reconnecte-toi.", true);
+    }
+    throw new Error(data.error || "Une erreur est survenue.");
+  }
+
   return data;
 }
 
@@ -37,8 +56,19 @@ function showAuth(mode) {
   $("#auth-panel").classList.remove("hidden");
   $("#auth-title").textContent = mode === "register" ? "Créer un compte" : "Connexion";
   $("#auth-submit").textContent = mode === "register" ? "Créer mon compte" : "Se connecter";
+  $("#password").autocomplete = mode === "register" ? "new-password" : "current-password";
   $("#auth-message").textContent = "";
   $("#password").value = "";
+  $("#username").focus();
+}
+
+function resetTabs() {
+  document.querySelectorAll(".tab").forEach((tab) =>
+    tab.classList.toggle("active", tab.dataset.page === "market")
+  );
+  document.querySelectorAll(".page-section").forEach((section) =>
+    section.classList.toggle("hidden", section.id !== "page-market")
+  );
 }
 
 function renderAccount() {
@@ -49,25 +79,24 @@ function renderAccount() {
 
   $("#account-area").innerHTML = connected
     ? `<span class="pill">${escapeHtml(currentUser.username)}</span>`
-    : `<button class="button secondary" id="show-login">Connexion</button>
-       <button class="button primary" id="show-register">Créer un compte</button>`;
+    : `<button type="button" class="button secondary" id="show-login">Connexion</button>
+       <button type="button" class="button primary" id="show-register">Créer un compte</button>`;
 
   if (connected) {
     $("#user-name").textContent = currentUser.username;
     $("#balance").textContent = money(currentUser.balance);
     $("#admin-tab").classList.toggle("hidden", currentUser.role !== "admin");
   }
-
-  $("#show-login")?.addEventListener("click", () => showAuth("login"));
-  $("#show-register")?.addEventListener("click", () => showAuth("register"));
 }
 
-function escapeHtml(value) {
-  return String(value ?? "").replace(/[&<>"']/g, (char) => ({
-    "&": "&amp;", "<": "&lt;", ">": "&gt;",
-    '"': "&quot;", "'": "&#39;"
-  })[char]);
-}
+// Un seul écouteur pour les boutons Connexion / Créer un compte,
+// même après que la zone du compte a été redessinée.
+$("#account-area").addEventListener("click", (event) => {
+  const button = event.target.closest("button");
+  if (!button) return;
+  if (button.id === "show-login") showAuth("login");
+  if (button.id === "show-register") showAuth("register");
+});
 
 async function loadMarket() {
   const data = await api("/api/market");
@@ -82,28 +111,32 @@ async function loadMarket() {
         <p class="muted">Cours simulé</p>
         <p>Quantité</p>
         <input type="number" min="0.001" max="1000000" step="0.001"
-          id="qty-${escapeHtml(asset.symbol)}" value="1">
+          class="qty-input" value="1" aria-label="Quantité pour ${escapeHtml(asset.symbol)}">
         <div style="display:flex;gap:8px;margin-top:12px">
-          <button class="button primary" data-trade="buy" data-symbol="${escapeHtml(asset.symbol)}">Acheter</button>
-          <button class="button secondary" data-trade="sell" data-symbol="${escapeHtml(asset.symbol)}">Vendre</button>
+          <button type="button" class="button primary" data-trade="buy" data-symbol="${escapeHtml(asset.symbol)}">Acheter</button>
+          <button type="button" class="button secondary" data-trade="sell" data-symbol="${escapeHtml(asset.symbol)}">Vendre</button>
         </div>
       </article>`).join("")
     : "<p>Aucun actif disponible.</p>";
 
   $("#market-list").querySelectorAll("[data-trade]").forEach(button => {
     button.addEventListener("click", async () => {
-      const symbol = button.dataset.symbol;
-      const quantity = Number($(`#qty-${CSS.escape(symbol)}`).value);
+      const card = button.closest(".asset-card");
+      const quantity = Number(card.querySelector(".qty-input").value);
 
-      if (!Number.isFinite(quantity) || quantity <= 0) {
+      if (!Number.isFinite(quantity) || quantity <= 0 || quantity > 1000000) {
         return showMessage("Saisis une quantité valide.", true);
       }
+
+      // Évite les doubles clics qui enverraient deux ordres.
+      const buttons = card.querySelectorAll("button");
+      buttons.forEach(item => { item.disabled = true; });
 
       try {
         const result = await api("/api/trade", {
           method: "POST",
           body: JSON.stringify({
-            symbol,
+            symbol: button.dataset.symbol,
             quantity,
             side: button.dataset.trade
           })
@@ -111,11 +144,11 @@ async function loadMarket() {
 
         currentUser.balance = result.balance;
         renderAccount();
-        await loadMarket();
-        await loadPortfolio();
         showMessage("Opération simulée effectuée.");
+        await Promise.all([loadMarket(), loadPortfolio()]);
       } catch (error) {
         showMessage(error.message, true);
+        buttons.forEach(item => { item.disabled = false; });
       }
     });
   });
@@ -139,13 +172,15 @@ async function loadShop() {
         <p>${escapeHtml(pack.description)}</p>
         <div class="price">${money(pack.price)}</div>
         <p class="muted">Stock : ${Number(pack.stock) || 0}</p>
-        <button class="button primary full" data-pack="${Number(pack.id)}"
+        <button type="button" class="button primary full" data-pack="${Number(pack.id)}"
           ${Number(pack.stock) <= 0 ? "disabled" : ""}>Acheter le pack</button>
       </article>`).join("")
     : "<p>La boutique est vide pour le moment.</p>";
 
   $("#shop-list").querySelectorAll("[data-pack]").forEach(button => {
     button.addEventListener("click", async () => {
+      button.disabled = true;
+
       try {
         const result = await api("/api/shop/buy", {
           method: "POST",
@@ -153,11 +188,11 @@ async function loadShop() {
         });
         currentUser.balance = result.balance;
         renderAccount();
-        await loadShop();
-        await loadCollection();
         showMessage("Pack ouvert ! Tes cartes ont été ajoutées à ta collection.");
+        await Promise.all([loadShop(), loadCollection()]);
       } catch (error) {
         showMessage(error.message, true);
+        button.disabled = false;
       }
     });
   });
@@ -208,29 +243,43 @@ async function loadAdmin() {
     </article>`).join("") || "<p>Aucun utilisateur.</p>";
 }
 
+// Charge toutes les sections ; une section en échec n'empêche pas
+// les autres de s'afficher. Retourne true si tout s'est bien passé.
 async function refreshDashboard() {
   renderAccount();
-  if (!currentUser) return;
+  if (!currentUser) return false;
 
-  await Promise.all([
+  const tasks = [
     loadMarket(),
     loadPortfolio(),
     loadShop(),
     loadCollection(),
     loadTitles()
-  ]);
+  ];
 
-  if (currentUser.role === "admin") await loadAdmin();
+  if (currentUser.role === "admin") tasks.push(loadAdmin());
+
+  const results = await Promise.allSettled(tasks);
+  const failure = results.find(result => result.status === "rejected");
+
+  if (failure) {
+    showMessage(failure.reason?.message || "Chargement incomplet.", true);
+    return false;
+  }
+
+  return true;
 }
 
-$("#show-login").addEventListener("click", () => showAuth("login"));
-$("#show-register").addEventListener("click", () => showAuth("register"));
 $("#close-auth").addEventListener("click", () => $("#auth-panel").classList.add("hidden"));
 
 $("#auth-form").addEventListener("submit", async (event) => {
   event.preventDefault();
+
+  const submit = $("#auth-submit");
   const username = $("#username").value.trim();
   const password = $("#password").value;
+
+  submit.disabled = true;
 
   try {
     const result = await api(authMode === "register" ? "/api/register" : "/api/login", {
@@ -239,10 +288,17 @@ $("#auth-form").addEventListener("submit", async (event) => {
     });
 
     currentUser = result.user;
-    await refreshDashboard();
-    showMessage("Bienvenue sur Sigma Exchange !");
+    $("#password").value = "";
+    $("#auth-message").textContent = "";
+    resetTabs();
+    showMessage("");
+
+    const loaded = await refreshDashboard();
+    if (loaded) showMessage("Bienvenue sur Sigma Exchange !");
   } catch (error) {
     showMessage(error.message, true, "#auth-message");
+  } finally {
+    submit.disabled = false;
   }
 });
 
@@ -250,6 +306,7 @@ $("#logout").addEventListener("click", async () => {
   try {
     await api("/api/logout", { method: "POST" });
     currentUser = null;
+    resetTabs();
     renderAccount();
     showMessage("Tu es déconnecté.");
   } catch (error) {
@@ -297,7 +354,7 @@ async function init() {
     }
   } catch (error) {
     console.error("Initialisation :", error);
-    showMessage("Impossible de charger le site. Vérifie le serveur.");
+    showMessage("Impossible de charger le site. Vérifie le serveur.", true);
   }
 }
 
